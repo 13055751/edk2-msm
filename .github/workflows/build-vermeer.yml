@@ -1,0 +1,147 @@
+name: Build UEFI for Redmi K70 (vermeer)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '构建模式'
+        required: true
+        default: 'RELEASE'
+        type: choice
+        options:
+          - RELEASE
+          - DEBUG
+      installer_zip:
+        description: '额外生成可刷入的 installer zip'
+        required: false
+        default: false
+        type: boolean
+      sanity_fuxi:
+        description: '先编译 fuxi（小米 13）作为流水线对照'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: vermeer / SM8550
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: 检出 edk2-msm（含全部 submodule）
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: 安装构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential uuid-dev iasl nasm \
+            python3 python3-distutils \
+            clang lld llvm git zip
+
+      - name: 校验移植文件是否齐备
+        run: |
+          set -e
+          need="
+            configs/devices/vermeer.conf
+            Platform/Xiaomi/sm8550/vermeer.dsc
+            Platform/Xiaomi/sm8550/vermeer.fdf.inc
+            Platform/Xiaomi/sm8550/FdtBlob_compat/vermeer.dtb
+          "
+          for f in $need; do
+            if [ -f "$f" ]; then
+              printf '  OK   %s (%s bytes)\n' "$f" "$(wc -c < "$f")"
+            else
+              printf '  MISS %s\n' "$f"
+              exit 1
+            fi
+          done
+          echo "移植文件齐备，开始编译。"
+
+      # ---------------------------------------------------------------------
+      # 保险 1：先编一台已知可用的机器，确认流水线本身没问题。
+      # 若 fuxi 编不出来 → 是环境/配置问题；若 fuxi 能编而 vermeer 不能
+      # → 问题就锁定在移植层，排查范围立刻缩到四个文件。
+      # ---------------------------------------------------------------------
+      - name: 对照构建 fuxi（可选）
+        if: ${{ github.event.inputs.sanity_fuxi == 'true' }}
+        timeout-minutes: 120
+        run: |
+          chmod +x build.sh
+          ./build.sh -d fuxi -r RELEASE
+          echo "=== fuxi 构建成功，流水线健康 ==="
+          ls -lh boot-fuxi.img
+
+      - name: 编译 UEFI (vermeer)
+        timeout-minutes: 120
+        run: |
+          chmod +x build.sh
+          EXTRA=""
+          if [ "${{ github.event.inputs.installer_zip }}" = "true" ]; then
+            EXTRA="-z"
+          fi
+          ./build.sh -d vermeer -r "${{ github.event.inputs.mode || 'RELEASE' }}" $EXTRA
+
+      # ---------------------------------------------------------------------
+      # 保险 2：产物自检。结构不对就让流水线直接红掉，
+      # 省得你下载回来、刷进去、才发现它根本不是个能启动的东西。
+      # ---------------------------------------------------------------------
+      - name: 产物自检
+        run: |
+          set +e
+          if [ ! -f boot-vermeer.img ]; then
+            echo "::error::没有生成 boot-vermeer.img"
+            exit 1
+          fi
+          V="$GITHUB_WORKSPACE/.github/scripts/verify-image.py"
+          [ -f "$V" ] || V="$(dirname "$(find "$GITHUB_WORKSPACE" -name verify-image.py -print -quit)")/verify-image.py"
+          if [ -f "$V" ]; then
+            python3 "$V" boot-vermeer.img --partition-size 192MiB
+            RC=$?
+          else
+            echo "::warning::找不到 verify-image.py，跳过结构自检"
+            RC=0
+          fi
+          if [ "$RC" = "1" ]; then
+            echo "::error::镜像自检发现致命问题，见上方报告"
+            exit 1
+          fi
+          echo "自检完成（退出码 $RC）"
+
+      - name: 收集产物
+        if: always()
+        run: |
+          mkdir -p out
+          find . -maxdepth 1 -name 'boot-vermeer*.img'  -exec cp -v {} out/ \; || true
+          find . -maxdepth 1 -name 'boot-fuxi*.img'     -exec cp -v {} out/ \; || true
+          find . -maxdepth 1 -name 'uefi-installer-vermeer*.zip' -exec cp -v {} out/ \; || true
+          find ./workspace -maxdepth 1 -name 'uefi-vermeer*' -exec cp -v {} out/ \; || true
+          find ./Build -name '*.fd' -exec cp -v {} out/ \; 2>/dev/null || true
+          echo "===== 产物清单 ====="
+          ls -lh out/ || true
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: uefi-vermeer-${{ github.run_number }}
+          path: out/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: 编译日志（失败时留存）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.run_number }}
+          path: |
+            Build/vermeer/**/*.log
+            Build/vermeer/**/*.txt
+          retention-days: 7
+          if-no-files-found: ignore
